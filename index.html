@@ -1,0 +1,714 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, addDoc, getDocs } from 'firebase/firestore';
+
+// Global variables for Firebase config and app ID
+// These are provided by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase App
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// Default pricing and material data (used if no data in Firestore or for reset)
+const DEFAULT_PRICING_DATA = {
+  fencing: {
+    Colorbond: { '1.2m': 65, '1.5m': 75, '1.8m': 85, '2.1m': 95 }, // Price per linear meter
+    'Timber Picket': { '1.2m': 50, '1.5m': 60, '1.8m': 70, '2.1m': 80 },
+    Tubular: { '1.2m': 80, '1.5m': 90, '1.8m': 100, '2.1m': 110 },
+    'Pool Fencing': { '1.2m': 70, '1.5m': 80, '1.8m': 90, '2.1m': 100 },
+    'Chain Link': { '1.2m': 40, '1.5m': 50, '1.8m': 60, '2.1m': 70 },
+  },
+  gates: {
+    Pedestrian: 350,
+    'Single Swing': 500,
+    'Double Swing': 800,
+    Sliding: 1200,
+  },
+  gateMotorCost: 750, // Price for a gate motor
+  cornerPostCost: 50, // Price for each corner post
+  taxRate: 0.10, // 10% GST/Tax
+
+  materialPriceList: {
+    '100x50 RHS': { pricePerUnit: 81.58, unitLength: 8000 },
+    '40x40 SHS': { pricePerUnit: 35.72, unitLength: 8000 },
+    '50x10 Pickets': { pricePerUnit: 19.72, unitLength: 7320 },
+    'Picket Top': { pricePerUnit: 1.69, unitLength: 1 },
+    '89x89 Post': { pricePerUnit: 97.50, unitLength: 8000 },
+    '65x65 Post': { pricePerUnit: 59.48, unitLength: 8000 },
+    '40x40 Angle': { pricePerUnit: 28.45, unitLength: 6000 },
+    'Adjustable Hinges': { pricePerUnit: 18.15, unitLength: 1 },
+    'Truclose Hinges': { pricePerUnit: 80.64, unitLength: 1 },
+    'D latch': { pricePerUnit: 6.85, unitLength: 1 },
+    'Lokk Latch Deluxe': { pricePerUnit: 70.25, unitLength: 1 },
+    '001 Deadlock': { pricePerUnit: 138.50, unitLength: 1 },
+    '40x40 Rail Brackets': { pricePerUnit: 2.25, unitLength: 1 },
+    '90x90 Caps': { pricePerUnit: 3.80, unitLength: 1 },
+    '65x65 Caps': { pricePerUnit: 1.25, unitLength: 1 },
+    'Guide Rollers': { pricePerUnit: 8.15, unitLength: 1 },
+    'Guide Bracket': { pricePerUnit: 8.85, unitLength: 1 },
+    '100x50 Cap': { pricePerUnit: 6.58, unitLength: 1 },
+    'Gate Wheel': { pricePerUnit: 20.16, unitLength: 1 },
+    '50mm Catch': { pricePerUnit: 18.56, unitLength: 1 },
+    'Gate Track': { pricePerUnit: 32.60, unitLength: 3000 },
+    'Livi Split Pack': { pricePerUnit: 859.32, unitLength: 1 },
+    'Livi 24V': { pricePerUnit: 614.24, unitLength: 1 },
+    'Rev 24V': { pricePerUnit: 1043.46, unitLength: 1 },
+    '30W Solar Kit': { pricePerUnit: 969.70, unitLength: 1 },
+    'Gear rack': { pricePerUnit: 23.85, unitLength: 1000 },
+    'Battery backup': { pricePerUnit: 68.97, unitLength: 1 },
+    'Antenna': { pricePerUnit: 42.55, unitLength: 1 },
+    'Ziggy Remote': { pricePerUnit: 47.65, unitLength: 1 },
+  },
+  powderCoatingRates: {
+    '65x65 Post': 5.50,
+    '89x89 Post': 7.70,
+    'Panel_Gate_Area': 55.00, // per square meter
+    'Per_Piece_Powder_Coat': 2.00 // General rate for individual items
+  },
+  installationCosts: {
+    INSTALL_POSTS_FIXED: 1250,
+    INSTALL_SLIDING_GATE_FIXED: 1750,
+    INSTALL_PEDESTRIAN_GATE_FIXED: 750,
+    INSTALL_PANELS_PER_METER: 65,
+  },
+  fabricationCosts: {
+    FABRICATION_COST_PER_DAY: 1250,
+    FABRICATION_DAYS_PER_JOB: 2,
+  },
+  profitMargins: {
+    PROFIT_SLIDING_GATE_MATERIAL: 0.55, // 55%
+    PROFIT_PEDESTRIAN_GATE_MATERIAL: 0.55, // 55%
+    PROFIT_PANELS_MATERIAL: 0.50, // 50%
+    PROFIT_POSTS_CAPS_BRACKETS_MATERIAL: 0.35, // 35%
+    PROFIT_POWDER_COATING: 0.25, // 25%
+    PROFIT_GATE_MOTORS: 0.55, // 55%
+    PROFIT_GATE_MOTOR_HARDWARE: 0.70, // 70%
+  }
+};
+
+const IDEAL_PANEL_2_4M = 2400; // Constant for panel optimization
+
+// Main App component for the Fencing Quote Calculator
+function App() {
+  // Authentication state
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // Pricing data from Firestore
+  const [pricingData, setPricingData] = useState(null);
+  const [isPricingLoading, setIsPricingLoading] = useState(true);
+
+  // State variables to store user inputs for the quote
+  const [overallBoundaryLength, setOverallBoundaryLength] = useState('');
+  const [fenceHeight, setFenceHeight] = useState('');
+  const [postSize, setPostSize] = useState('65'); // Default post size
+  const [slidingGateYes, setSlidingGateYes] = useState(false);
+  const [slidingGateLength, setSlidingGateLength] = useState('');
+  const [gateMotorYes, setGateMotorYes] = useState(false);
+  const [motorType, setMotorType] = useState('');
+  const [batteryBackup, setBatteryBackup] = useState(false);
+  const [antenna, setAntenna] = useState(false);
+  const [ziggyRemote, setZiggyRemote] = useState(false);
+  const [ziggyRemoteQty, setZiggyRemoteQty] = useState(1);
+  const [pedestrianGateYes, setPedestrianGateYes] = useState(false);
+  const [pedestrianGateWidth, setPedestrianGateWidth] = useState('');
+  const [hingeType, setHingeType] = useState('Adjustable Hinges');
+  const [latchType, setLatchType] = useState('D latch');
+
+  // State for calculated panel info (displayed in UI)
+  const [calculatedNumPanels, setCalculatedNumPanels] = useState(0);
+  const [calculatedPanelLengthDisplay, setCalculatedPanelLengthDisplay] = useState('0mm');
+  const [calculatedFenceLinearLength, setCalculatedFenceLinearLength] = useState('0mm');
+  const [panelHint, setPanelHint] = useState("Enter overall boundary length to calculate panels.");
+
+  // State for advanced settings (editable from UI)
+  const [profitMargins, setProfitMargins] = useState(DEFAULT_PRICING_DATA.profitMargins);
+  const [installationCosts, setInstallationCosts] = useState(DEFAULT_PRICING_DATA.installationCosts);
+  const [fabricationCosts, setFabricationCosts] = useState(DEFAULT_PRICING_DATA.fabricationCosts);
+
+  // State for editable fencing and gate prices
+  const [editableFencingPrices, setEditableFencingPrices] = useState(DEFAULT_PRICING_DATA.fencing);
+  const [editableGatePrices, setEditableGatePrices] = useState(DEFAULT_PRICING_DATA.gates);
+  const [editableGateMotorCost, setEditableGateMotorCost] = useState(DEFAULT_PRICING_DATA.gateMotorCost);
+  const [editableCornerPostCost, setEditableCornerPostCost] = useState(DEFAULT_PRICING_DATA.cornerPostCost);
+  const [editableTaxRate, setEditableTaxRate] = useState(DEFAULT_PRICING_DATA.taxRate);
+
+
+  // States for results display
+  const [quoteResults, setQuoteResults] = useState(null);
+  const [totalCost, setTotalCost] = useState(0);
+  const [errorMessage, setErrorMessage] = useState('');
+
+  // Canvas ref for drawing fence layout
+  const canvasRef = React.useRef(null);
+
+  // Authentication Effect
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        // Sign in anonymously if no user is authenticated
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(auth, initialAuthToken);
+          } else {
+            await signInAnonymously(auth);
+          }
+        } catch (error) {
+          console.error("Firebase Auth Error:", error);
+        }
+      }
+      setIsAuthReady(true);
+    });
+
+    return () => unsubscribe();
+  }, [initialAuthToken]);
+
+
+  // Fetch/Listen to Pricing Data from Firestore
+  useEffect(() => {
+    if (!isAuthReady) return;
+
+    const pricingDocRef = doc(db, `artifacts/${appId}/public/data/pricing_config`, 'current_prices');
+
+    const unsubscribe = onSnapshot(pricingDocRef, async (docSnap) => {
+      if (docSnap.exists()) {
+        const fetchedData = docSnap.data();
+        setPricingData(fetchedData);
+        setProfitMargins(fetchedData.profitMargins || DEFAULT_PRICING_DATA.profitMargins);
+        setInstallationCosts(fetchedData.installationCosts || DEFAULT_PRICING_DATA.installationCosts);
+        setFabricationCosts(fetchedData.fabricationCosts || DEFAULT_PRICING_DATA.fabricationCosts);
+        setEditableFencingPrices(fetchedData.fencing || DEFAULT_PRICING_DATA.fencing);
+        setEditableGatePrices(fetchedData.gates || DEFAULT_PRICING_DATA.gates);
+        setEditableGateMotorCost(fetchedData.gateMotorCost || DEFAULT_PRICING_DATA.gateMotorCost);
+        setEditableCornerPostCost(fetchedData.cornerPostCost || DEFAULT_PRICING_DATA.cornerPostCost);
+        setEditableTaxRate(fetchedData.taxRate || DEFAULT_PRICING_DATA.taxRate);
+      } else {
+        // If document doesn't exist, create it with default data
+        console.log("No pricing data found, setting defaults in Firestore.");
+        await setDoc(pricingDocRef, DEFAULT_PRICING_DATA);
+        setPricingData(DEFAULT_PRICING_DATA);
+        setProfitMargins(DEFAULT_PRICING_DATA.profitMargins);
+        setInstallationCosts(DEFAULT_PRICING_DATA.installationCosts);
+        setFabricationCosts(DEFAULT_PRICING_DATA.fabricationCosts);
+        setEditableFencingPrices(DEFAULT_PRICING_DATA.fencing);
+        setEditableGatePrices(DEFAULT_PRICING_DATA.gates);
+        setEditableGateMotorCost(DEFAULT_PRICING_DATA.gateMotorCost);
+        setEditableCornerPostCost(DEFAULT_PRICING_DATA.cornerPostCost);
+        setEditableTaxRate(DEFAULT_PRICING_DATA.taxRate);
+      }
+      setIsPricingLoading(false);
+    }, (error) => {
+      console.error("Error fetching pricing data:", error);
+      setIsPricingLoading(false);
+      setErrorMessage("Failed to load pricing data. Please try again later.");
+    });
+
+    return () => unsubscribe();
+  }, [isAuthReady]); // Re-run when auth state is ready
+
+  // Save Pricing Data to Firestore
+  const handleSavePricing = async () => {
+    if (!userId || !pricingData) {
+      showMessageBox("Error", "Authentication or pricing data not ready.");
+      return;
+    }
+    setIsPricingLoading(true); // Indicate saving
+    try {
+      const pricingDocRef = doc(db, `artifacts/${appId}/public/data/pricing_config`, 'current_prices');
+      await setDoc(pricingDocRef, {
+        ...pricingData, // Keep non-editable parts
+        profitMargins,
+        installationCosts,
+        fabricationCosts,
+        fencing: editableFencingPrices,
+        gates: editableGatePrices,
+        gateMotorCost: editableGateMotorCost,
+        cornerPostCost: editableCornerPostCost,
+        taxRate: editableTaxRate
+      });
+      showMessageBox("Success", "Pricing data saved successfully!");
+    } catch (error) {
+      console.error("Error saving pricing data:", error);
+      showMessageBox("Error", "Failed to save pricing data. " + error.message);
+    } finally {
+      setIsPricingLoading(false);
+    }
+  };
+
+  // Reset Pricing Data to Defaults
+  const handleResetPricing = async () => {
+    if (!userId) {
+      showMessageBox("Error", "Authentication not ready.");
+      return;
+    }
+    setIsPricingLoading(true); // Indicate resetting
+    try {
+      const pricingDocRef = doc(db, `artifacts/${appId}/public/data/pricing_config`, 'current_prices');
+      await setDoc(pricingDocRef, DEFAULT_PRICING_DATA);
+      showMessageBox("Success", "Pricing data reset to defaults!");
+    } catch (error) {
+      console.error("Error resetting pricing data:", error);
+      showMessageBox("Error", "Failed to reset pricing data. " + error.message);
+    } finally {
+      setIsPricingLoading(false);
+    }
+  };
+
+
+  /**
+   * Displays a custom message box instead of using alert().
+   * @param {string} title - The title of the message box.
+   * @param {string} message - The content message.
+   */
+  const showMessageBox = useCallback((title, message) => {
+    const messageBox = document.getElementById('messageBox');
+    const messageBoxTitle = document.getElementById('messageBoxTitle');
+    const messageBoxContent = document.getElementById('messageBoxContent');
+    const overlay = document.getElementById('overlay');
+
+    if (messageBox && messageBoxTitle && messageBoxContent && overlay) {
+      messageBoxTitle.textContent = title;
+      messageBoxContent.textContent = message;
+      messageBox.style.display = 'block';
+      overlay.style.display = 'block';
+    }
+  }, []);
+
+  /**
+   * Closes the custom message box.
+   */
+  const closeMessageBox = useCallback(() => {
+    const messageBox = document.getElementById('messageBox');
+    const overlay = document.getElementById('overlay');
+    if (messageBox && overlay) {
+      messageBox.style.display = 'none';
+      overlay.style.display = 'none';
+    }
+  }, []);
+
+  /**
+   * Toggles the visibility of input fields based on checkbox selection.
+   * @param {boolean} isChecked - Whether the controlling checkbox is checked.
+   * @param {HTMLElement} inputContainerRef - The ref to the container holding the related input fields.
+   */
+  const toggleInputs = useCallback((isChecked, inputContainerRef) => {
+    if (inputContainerRef.current) {
+      if (isChecked) {
+        inputContainerRef.current.classList.remove('hidden');
+      } else {
+        inputContainerRef.current.classList.add('hidden');
+        // Reset values when hidden
+        Array.from(inputContainerRef.current.querySelectorAll('input[type="number"], select, input[type="checkbox"]')).forEach(input => {
+          if (input.type === 'number') input.value = '';
+          else if (input.tagName === 'SELECT') input.selectedIndex = 0;
+          else if (input.type === 'checkbox') input.checked = false;
+        });
+        // Specific reset for ziggyRemoteQty
+        if (inputContainerRef.current.contains(document.getElementById('ziggyRemoteQty'))) {
+          document.getElementById('ziggyRemoteQty').disabled = true;
+          setZiggyRemoteQty(1);
+        }
+      }
+    }
+  }, []);
+
+
+  // Refs for conditional input sections
+  const slidingGateInputsRef = React.useRef(null);
+  const motorInputsRef = React.useRef(null);
+  const pedestrianGateInputsRef = React.useRef(null);
+
+  // Effects to toggle input visibility based on state
+  useEffect(() => toggleInputs(slidingGateYes, slidingGateInputsRef), [slidingGateYes, toggleInputs]);
+  useEffect(() => toggleInputs(gateMotorYes, motorInputsRef), [gateMotorYes, toggleInputs]);
+  useEffect(() => toggleInputs(pedestrianGateYes, pedestrianGateInputsRef), [pedestrianGateYes, toggleInputs]);
+
+  // Handle Ziggy Remote quantity
+  const handleZiggyRemoteChange = (e) => {
+    const checked = e.target.checked;
+    setZiggyRemote(checked);
+    if (!checked) {
+      setZiggyRemoteQty(1); // Reset quantity when unchecked
+    }
+  };
+
+
+  /**
+   * Calculates and updates the displayed fence panel information.
+   * This function is triggered by input changes to provide live feedback.
+   */
+  const updateFencePanelInfo = useCallback(() => {
+    const overallLength = parseFloat(overallBoundaryLength) || 0;
+    let currentLinearFenceLength = overallLength;
+    const sGateLen = slidingGateYes ? (parseFloat(slidingGateLength) || 0) : 0;
+    const pGateWid = pedestrianGateYes ? (parseFloat(pedestrianGateWidth) || 0) : 0;
+
+    currentLinearFenceLength -= (sGateLen + pGateWid);
+
+    if (currentLinearFenceLength < 0) {
+      setCalculatedNumPanels(0);
+      setCalculatedPanelLengthDisplay('0mm');
+      setCalculatedFenceLinearLength('0mm');
+      setPanelHint("Combined gate lengths exceed overall boundary.");
+      return;
+    }
+
+    if (currentLinearFenceLength > 0 && overallLength > 0) {
+      setPanelHint("");
+      const { numPanels, individualPanelLengths } = calculatePanelDistribution(currentLinearFenceLength);
+      const panelDisplayString = getPanelDisplayString(individualPanelLengths, IDEAL_PANEL_2_4M);
+
+      setCalculatedNumPanels(numPanels);
+      setCalculatedPanelLengthDisplay(panelDisplayString);
+      setCalculatedFenceLinearLength(`${currentLinearFenceLength.toFixed(0)}mm`);
+    } else {
+      setCalculatedNumPanels(0);
+      setCalculatedPanelLengthDisplay('0mm');
+      setCalculatedFenceLinearLength('0mm');
+      setPanelHint("Enter overall boundary length to calculate panels.");
+    }
+  }, [overallBoundaryLength, slidingGateYes, slidingGateLength, pedestrianGateYes, pedestrianGateWidth]);
+
+  // Effects for live updates based on input changes
+  useEffect(() => { updateFencePanelInfo(); }, [overallBoundaryLength, slidingGateLength, pedestrianGateWidth, slidingGateYes, pedestrianGateYes, updateFencePanelInfo]);
+
+
+  /**
+   * Calculates the number of full stock units needed for a given length of material.
+   * @param {number} requiredLength - The total length of material required in mm.
+   * @param {number} unitLength - The length of one stock unit in mm.
+   * @returns {number} The number of stock units (rounded up).
+   */
+  const calculateUnitsNeeded = (requiredLength, unitLength) => {
+    if (requiredLength <= 0 || unitLength <= 0) return 0;
+    return Math.ceil(requiredLength / unitLength);
+  };
+
+  /**
+   * Helper function to format material output HTML for the new multi-line format.
+   * @param {string} name - Name of the material.
+   * @param {number} displayAmount - Quantity or number of lengths.
+   * @param {string} unitType - Unit type (e.g., 'pcs', 'x 8000mm lengths').
+   * @param {number} cost - Cost of the material.
+   * @returns {string} HTML string for the material line item.
+   */
+  const formatLineItem = (name, displayAmount, unitType, cost) => {
+    return `
+      <div class="material-line-item">
+          <div class="item-name">${name}:</div>
+          <div class="item-qty-unit">${displayAmount} ${unitType}</div>
+          <div class="item-cost">$${cost.toFixed(2)}</div>
+      </div>
+    `;
+  };
+
+  /**
+   * Calculates the individual panel lengths based on total linear fence length,
+   * ensuring all panels are exactly 2.4m, except for the last one which takes the remainder.
+   * @param {number} linearFenceLength - The total length available for fence panels.
+   * @returns {{numPanels: number, averagePanelLength: number, individualPanelLengths: number[]}}
+   */
+  const calculatePanelDistribution = (linearFenceLength) => {
+    const individualPanelLengths = [];
+    if (linearFenceLength <= 0) {
+      return { numPanels: 0, averagePanelLength: 0, individualPanelLengths: [] };
+    }
+
+    let numFullPanels = Math.floor(linearFenceLength / IDEAL_PANEL_2_4M);
+    let remainder = linearFenceLength % IDEAL_PANEL_2_4M;
+
+    for (let i = 0; i < numFullPanels; i++) {
+      individualPanelLengths.push(IDEAL_PANEL_2_4M);
+    }
+    if (remainder > 0) {
+      individualPanelLengths.push(remainder);
+    }
+
+    const numPanels = individualPanelLengths.length;
+    const totalLengthCalculated = individualPanelLengths.reduce((sum, length) => sum + length, 0);
+    const averagePanelLength = numPanels > 0 ? (totalLengthCalculated / numPanels) : 0;
+
+    return { numPanels, averagePanelLength, individualPanelLengths };
+  };
+
+  /**
+   * Generates the display string for panel lengths (e.g., "5 x 2400mm, 1 x 600mm").
+   * @param {number[]} panelsArray - An array of individual panel lengths.
+   * @param {number} idealPanelLength - The standard ideal panel length (e.g., 2400).
+   * @returns {string} The formatted string.
+   */
+  const getPanelDisplayString = (panelsArray, idealPanelLength) => {
+    if (!panelsArray || panelsArray.length === 0) {
+      return 'N/A';
+    }
+
+    let fullPanelCount = 0;
+    let lastPanelLength = 0;
+
+    for (let i = 0; i < panelsArray.length; i++) {
+      if (Math.abs(panelsArray[i] - idealPanelLength) < 0.1) {
+        fullPanelCount++;
+      }
+    }
+
+    if (panelsArray.length > 0 && Math.abs(panelsArray[panelsArray.length - 1] - idealPanelLength) >= 0.1) {
+      lastPanelLength = panelsArray[panelsArray.length - 1];
+    }
+
+    let displayString = '';
+    if (fullPanelCount > 0) {
+      displayString += `${fullPanelCount} x ${idealPanelLength}mm`;
+    }
+    if (lastPanelLength > 0) {
+      if (displayString !== '') {
+        displayString += `, `;
+      }
+      displayString += `1 x ${lastPanelLength.toFixed(0)}mm`;
+    }
+    if (displayString === '' && panelsArray.length === 1 && panelsArray[0] > 0) {
+      displayString = `1 x ${panelsArray[0].toFixed(0)}mm`;
+    } else if (displayString === '' && panelsArray.length === 0) {
+      displayString = 'N/A';
+    }
+    return displayString;
+  };
+
+  /**
+   * Draws the bird's eye view of the fence layout on the canvas.
+   * @param {object} layoutData - Object containing dimensions and layout elements.
+   */
+  const drawFenceLayout = useCallback((layoutData) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height); // Clear canvas
+
+    const canvasWidth = canvas.width;
+    const canvasHeight = canvas.height;
+    const padding = 20; // Padding from canvas edges
+    const fenceLineY = canvasHeight / 2;
+    const postSizePx = 8; // Visual size of a post marker, slightly larger for clarity
+    const textOffset = 25; // Vertical offset for text labels above segments
+
+    // Calculate scale: 1 pixel represents how many mm?
+    const drawingAreaWidth = canvasWidth - (2 * padding);
+    const scale = drawingAreaWidth / layoutData.overallLength; // mm per pixel
+
+    if (layoutData.overallLength <= 0 || !isFinite(scale)) {
+      ctx.fillStyle = '#ef4444';
+      ctx.font = '14px Inter';
+      ctx.fillText('Enter positive boundary length for drawing.', padding, fenceLineY);
+      return;
+    }
+
+    let currentX = padding; // Starting X position for drawing
+
+    // Function to draw a segment (gate or panel)
+    const drawSegment = (startX, length, type, color, label) => {
+      const segmentWidthPx = length * scale;
+      const endX = startX + segmentWidthPx;
+
+      // Draw segment rectangle
+      ctx.fillStyle = color;
+      ctx.fillRect(startX, fenceLineY - 10, segmentWidthPx, 20); // Wider for better visibility
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(startX, fenceLineY - 10, segmentWidthPx, 20);
+
+      // Add text label
+      ctx.fillStyle = '#1f2937';
+      ctx.font = '14px Inter';
+
+      let displayLabel = '';
+      if (type === 'sliding-gate') {
+        displayLabel = `Sliding Gate (${length.toFixed(0)})`;
+      } else if (type === 'pedestrian-gate') {
+        displayLabel = `PA (${length.toFixed(0)})`;
+      } else if (type === 'panel') {
+        displayLabel = `${length.toFixed(0)}`;
+      } else {
+        displayLabel = label;
+      }
+
+      const textWidth = ctx.measureText(displayLabel).width;
+      ctx.fillText(displayLabel, startX + (segmentWidthPx / 2) - (textWidth / 2), fenceLineY - textOffset);
+
+      return endX;
+    };
+
+    // Function to draw a post
+    const drawPost = (x, isSlidingExtra = false) => {
+      ctx.fillStyle = isSlidingExtra ? '#FFD700' : '#4b5563'; // Gold for extra sliding post
+      ctx.fillRect(x - (postSizePx / 2), fenceLineY - (postSizePx / 2), postSizePx, postSizePx);
+      ctx.strokeStyle = '#374151';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x - (postSizePx / 2), fenceLineY - (postSizePx / 2), postSizePx, postSizePx);
+    };
+
+    if (layoutData.overallLength > 0) {
+      drawPost(currentX); // Post at the very beginning of the boundary
+    }
+
+    if (layoutData.slidingGate.present && layoutData.slidingGate.length > 0) {
+      currentX = drawSegment(currentX, layoutData.slidingGate.length, 'sliding-gate', '#60a5fa', 'Sliding Gate');
+      drawPost(currentX); // Post at the end of the sliding gate segment
+      const extraPostX = currentX + (150 * scale); // Visually represent the 3rd post slightly beyond
+      if (extraPostX < canvasWidth - padding) {
+        drawPost(extraPostX, true); // Mark as special
+      }
+    }
+
+    if (layoutData.pedestrianGate.present && layoutData.pedestrianGate.width > 0) {
+      currentX = drawSegment(currentX, layoutData.pedestrianGate.width, 'pedestrian-gate', '#818cf8', 'Pedestrian Gate');
+      drawPost(currentX); // Post at the end of the pedestrian gate segment
+    }
+
+    if (layoutData.panels.present && layoutData.panels.individualPanelLengths.length > 0) {
+      layoutData.panels.individualPanelLengths.forEach((panelLength) => {
+        currentX = drawSegment(currentX, panelLength, 'panel', '#d1d5db', `Panel`);
+        drawPost(currentX); // Post at the end of each panel
+      });
+    }
+  }, []); // Dependencies are only the canvasRef, as layoutData is passed as an argument
+
+
+  /**
+   * Main function to calculate the fencing quote.
+   * @param {Event} event - The form submission event.
+   */
+  const calculateQuote = useCallback((event) => {
+    event.preventDefault(); // Prevent default form submission
+
+    if (!pricingData) {
+      setErrorMessage("Pricing data is still loading. Please wait.");
+      return;
+    }
+
+    // Clear previous results and errors
+    setQuoteResults(null);
+    setTotalCost(0);
+    setErrorMessage('');
+    const ctx = canvasRef.current.getContext('2d');
+    ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+
+    // Destructure pricing data for easier access
+    const {
+      materialPriceList,
+      powderCoatingRates,
+      installationCosts: currentInstallationCosts,
+      fabricationCosts: currentFabricationCosts,
+      profitMargins: currentProfitMargins,
+      fencing: currentFencingPrices,
+      gates: currentGatePrices,
+      gateMotorCost: currentGateMotorCost,
+      cornerPostCost: currentCornerPostCost
+    } = pricingData;
+
+
+    // Initialize quote sections with specific cost categories
+    let quoteSections = {
+      posts: { materialCost: 0, materialsBreakdown: [], numCalculated: 0, length: 0 },
+      slidingGate: { materialCost: 0, materialsBreakdown: [], totalFrameLength: 0, present: false, length: 0 },
+      slidingGateFittings: { materialCost: 0, materialsBreakdown: [], present: false },
+      gateMotors: { motorMaterialCost: 0, motorBreakdown: [], hardwareMaterialCost: 0, hardwareBreakdown: [], present: false },
+      pedestrianGate: { materialCost: 0, materialsBreakdown: [], totalFrameLength: 0, present: false, width: 0, hingeType: '', latchType: '' },
+      fencePanels: { materialCost: 0, materialsBreakdown: [], totalLength: 0, numPanels: 0, individualPanelLengths: [], present: false },
+      powderCoating: { baseCost: 0, breakdown: [] },
+      totalMaterialCostWithProfit: 0,
+      totalInstallationCost: 0,
+      totalFabricationCost: 0
+    };
+    let errors = [];
+
+    // Get numerical inputs
+    const fenceHt = parseFloat(fenceHeight);
+    const postSz = parseInt(postSize);
+
+    // Auto-calculate post length
+    const calculatedPostLength = fenceHt + 600;
+    if (isNaN(calculatedPostLength) || calculatedPostLength <= 600) {
+      errors.push("Please enter a valid Fence Height (mm) to calculate post length.");
+    } else {
+      quoteSections.posts.length = calculatedPostLength;
+    }
+
+    // Sliding Gate Dimensions & Check
+    let sGateLen = 0;
+    if (slidingGateYes) {
+      sGateLen = parseFloat(slidingGateLength);
+      if (isNaN(sGateLen) || sGateLen <= 0) errors.push("Please enter a valid Sliding Gate Length.");
+      if (errors.length === 0) {
+        quoteSections.slidingGate.present = true;
+        quoteSections.slidingGate.length = sGateLen;
+        quoteSections.slidingGateFittings.present = true;
+      }
+    }
+
+    // Gate Motor Calculation & Check
+    if (gateMotorYes) {
+      if (!motorType) errors.push("Please select a Gate Motor Type.");
+
+      if (errors.length === 0) {
+        quoteSections.gateMotors.present = true;
+        const motorInfo = materialPriceList[motorType];
+        if (motorInfo) {
+          const rawMotorCost = motorInfo.pricePerUnit;
+          const motorCostWithProfit = rawMotorCost * (1 + currentProfitMargins.PROFIT_GATE_MOTORS);
+          quoteSections.gateMotors.motorMaterialCost += motorCostWithProfit;
+          quoteSections.gateMotors.motorBreakdown.push({ name: motorType, displayAmount: 1, unitType: 'unit', cost: motorCostWithProfit });
+          quoteSections.totalMaterialCostWithProfit += motorCostWithProfit;
+        } else {
+          errors.push(`Price information for ${motorType} not found.`);
+        }
+
+        if (quoteSections.slidingGate.present && quoteSections.slidingGate.length > 0) {
+          const gearRackInfo = materialPriceList['Gear rack'];
+          if (gearRackInfo) {
+            const requiredRackLengthMM = quoteSections.slidingGate.length;
+            const rackUnitsNeeded = calculateUnitsNeeded(requiredRackLengthMM, gearRackInfo.unitLength);
+            const rawCostOfRack = rackUnitsNeeded * gearRackInfo.pricePerUnit;
+            const costOfRackWithProfit = rawCostOfRack * (1 + currentProfitMargins.PROFIT_GATE_MOTOR_HARDWARE);
+            quoteSections.gateMotors.hardwareMaterialCost += costOfRackWithProfit;
+            quoteSections.gateMotors.hardwareBreakdown.push({
+              name: 'Gear rack',
+              displayAmount: rackUnitsNeeded,
+              unitType: `x ${gearRackInfo.unitLength / 1000}m lengths (Total ${requiredRackLengthMM.toFixed(0)}mm)`,
+              cost: costOfRackWithProfit
+            });
+            quoteSections.totalMaterialCostWithProfit += costOfRackWithProfit;
+          } else {
+            errors.push('Price information for Gear rack not found.');
+          }
+        } else {
+          errors.push("Sliding Gate Length is required for Gear rack calculation when a motor is selected.");
+        }
+
+        // Motor accessories
+        const addMotorAccessory = (accessoryName, profitMarginKey) => {
+          const accessoryInfo = materialPriceList[accessoryName];
+          if (accessoryInfo) {
+            const rawCost = accessoryInfo.pricePerUnit * (accessoryName === 'Ziggy Remote' ? ziggyRemoteQty : 1);
+            const costWithProfit = rawCost * (1 + currentProfitMargins[profitMarginKey]);
+            quoteSections.gateMotors.hardwareMaterialCost += costWithProfit;
+            quoteSections.gateMotors.hardwareBreakdown.push({
+              name: accessoryName,
+              displayAmount: (accessoryName === 'Ziggy Remote' ? ziggyRemoteQty : 1),
+              unitType: 'pcs',
+              cost: costWithProfit
+            });
+            quoteSections.totalMaterialCostWithProfit += costWithProfit;
+          } else {
+            errors.push(`Price information for ${accessoryName} not found.`);
+          }
+        };
+
+        if (batteryBackup) addMotorAccessory('Battery backup', 'PROFIT_GATE_MOTOR_HARDWARE');
+        if (antenna) addMotorAccessory('Antenna', '
